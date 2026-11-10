@@ -1,11 +1,7 @@
-use crate::utils::pcm_to_wav;
-
 pub async fn transcribe(
     client: &reqwest::Client,
-    pcm: &[u8],
+    wav: Vec<u8>,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
-    let wav = pcm_to_wav(pcm)?;
-
     let file = reqwest::multipart::Part::bytes(wav)
         .file_name("audio.wav")
         .mime_str("audio/wav")?;

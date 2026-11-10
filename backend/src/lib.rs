@@ -2,7 +2,6 @@ pub mod asr;
 pub mod protocol;
 pub mod relay;
 pub mod state;
-mod utils;
 pub mod websocket;
 
 use axum::{Router, routing::get};
