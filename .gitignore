@@ -1,0 +1,5 @@
+# Rust build output (including nested crates)
+target/
+
+# Rustfmt backup files
+**/*.rs.bk
