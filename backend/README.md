@@ -76,3 +76,15 @@ Raw PCM costs about 32 KB/s ingress and 32 KB/s egress per active transmission, 
 Presence broadcasts, the shared state mutex, and a maintenance timer per connection suit a small local demo. Larger deployments should use one maintenance scheduler, partition routing state, cap connections and message rates, and avoid sending full presence snapshots on every change. Multiple server instances need explicit cross-instance routing or conversation affinity. Authentication, origin validation, and TLS are necessary additions for an internet deployment.
 
 Future transcription should receive audio through a separate bounded path with inference outside the relay's mutex and socket tasks. A slow transcription worker must not delay forwarding.
+
+## ASR sample test
+
+The sample integration test decodes the three WAVs in `asr/samples` to raw PCM, calls the Rust ASR client, and checks for a nonempty `message.content` in the service's Ollama response. It prints each transcript for manual review; it does not assert transcription accuracy against reference text.
+
+With the ASR service and model ready on port 8001, run from `backend/`:
+
+```sh
+cargo test --test asr_samples -- --ignored --nocapture
+```
+
+The live test is ignored by default because it requires the external service. Normal `cargo test --test asr_samples` validates that all fixtures match the relay's audio format without making inference requests.
