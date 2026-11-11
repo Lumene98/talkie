@@ -8,8 +8,8 @@ use uuid::Uuid;
 #[derive(Clone, Debug)]
 pub struct Config {
     pub queue_capacity: usize,
-    pub max_talk_duration: Duration,
-    pub audio_idle_timeout: Duration,
+    pub max_audio_duration: Duration,
+    pub upload_timeout: Duration,
     pub write_timeout: Duration,
 }
 
@@ -17,8 +17,8 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             queue_capacity: 32,
-            max_talk_duration: Duration::from_secs(15),
-            audio_idle_timeout: Duration::from_secs(3),
+            max_audio_duration: Duration::from_secs(15),
+            upload_timeout: Duration::from_secs(15),
             write_timeout: Duration::from_secs(2),
         }
     }
@@ -28,23 +28,21 @@ pub type SharedState = Arc<Mutex<AppState>>;
 
 pub struct AppState {
     pub users: HashMap<Uuid, ConnectedUser>,
-    pub transmissions: HashMap<Uuid, Transmission>,
     pub config: Config,
 }
 
 pub struct ConnectedUser {
     pub name: String,
-    pub outgoing: mpsc::Sender<Message>,
+    pub outgoing: mpsc::Sender<Vec<Message>>,
     pub cancel: watch::Sender<bool>,
-    pub active_transmission: Option<Uuid>,
+    pub pending_upload: Option<PendingUpload>,
 }
 
-pub struct Transmission {
-    pub sender_id: Uuid,
+pub struct PendingUpload {
+    pub message_id: Uuid,
     pub recipient_id: Uuid,
-    pub next_sequence: u32,
+    pub byte_length: usize,
     pub started_at: Instant,
-    pub last_audio_at: Instant,
 }
 
 impl AppState {
@@ -55,17 +53,27 @@ impl AppState {
         );
         Arc::new(Mutex::new(Self {
             users: HashMap::new(),
-            transmissions: HashMap::new(),
             config,
         }))
     }
 
-    pub fn send(&self, id: Uuid, message: Message) {
-        if let Some(user) = self.users.get(&id)
-            && user.outgoing.try_send(message).is_err()
-        {
-            let _ = user.cancel.send(true);
+    pub fn send(&self, id: Uuid, message: Message) -> bool {
+        self.send_batch(id, vec![message])
+    }
+
+    // A single queue item keeps metadata and its WAV adjacent on the wire.
+    pub fn send_batch(&self, id: Uuid, messages: Vec<Message>) -> bool {
+        let Some(user) = self.users.get(&id) else {
+            return false;
+        };
+        if *user.cancel.borrow() {
+            return false;
         }
+        if user.outgoing.try_send(messages).is_err() {
+            let _ = user.cancel.send(true);
+            return false;
+        }
+        true
     }
 
     pub fn error(&self, id: Uuid, code: &'static str, message: &'static str) {
@@ -79,7 +87,7 @@ impl AppState {
             .map(|(&id, user)| UserInfo {
                 id,
                 name: user.name.clone(),
-                busy: user.active_transmission.is_some(),
+                busy: user.pending_upload.is_some(),
             })
             .collect();
         users.sort_by_key(|user| user.id);

@@ -59,68 +59,62 @@ async fn control(socket: &mut Socket, value: Value) {
         .await
         .unwrap();
 }
-async fn start(sender: &mut Socket, recipient: Uuid) -> Uuid {
-    control(
-        sender,
-        json!({"type":"start_talk", "recipient_id":recipient}),
-    )
-    .await;
-    Uuid::parse_str(
-        event(sender, "talk_started").await["transmission_id"]
-            .as_str()
-            .unwrap(),
-    )
-    .unwrap()
+
+const HELLO: &[u8] = include_bytes!("../../asr/samples/01_hello.wav");
+const NUMBERS: &[u8] = include_bytes!("../../asr/samples/02_numbers.wav");
+const LONG: &[u8] = include_bytes!("../../asr/samples/03_long_message.wav");
+
+async fn begin(sender: &mut Socket, recipient: Uuid, length: usize) -> Uuid {
+    let request_id = Uuid::new_v4();
+    control(sender,json!({"type":"begin_upload","recipient_id":recipient,"request_id":request_id,"byte_length":length})).await;
+    let ready = event(sender, "upload_ready").await;
+    assert_eq!(ready["request_id"], request_id.to_string());
+    Uuid::parse_str(ready["message_id"].as_str().unwrap()).unwrap()
 }
-fn audio(id: Uuid, sequence: u32, bytes: usize) -> Vec<u8> {
-    let mut frame = id.as_bytes().to_vec();
-    frame.extend(sequence.to_le_bytes());
-    frame.extend((0..bytes).map(|i| (i % 255) as u8));
-    frame
-}
-async fn binary(socket: &mut Socket) -> Vec<u8> {
-    loop {
-        if let Message::Binary(data) = next(socket).await {
-            return data.to_vec();
-        }
+
+async fn received(socket: &mut Socket, message_id: Uuid, sender_id: Uuid, expected: &[u8]) {
+    let metadata = event(socket, "audio_message").await;
+    assert_eq!(metadata["message_id"], message_id.to_string());
+    assert_eq!(metadata["sender_id"], sender_id.to_string());
+    assert_eq!(metadata["byte_length"], expected.len());
+    // Nothing, including presence, may separate metadata from its payload.
+    match next(socket).await {
+        Message::Binary(bytes) => assert_eq!(bytes.as_ref(), expected),
+        other => panic!("Expected WAV immediately after metadata, got {other:?}"),
     }
 }
 
 #[tokio::test]
-async fn routes_ordered_audio_and_release_then_reverse_direction() {
+async fn delivers_all_sample_wavs_privately_and_acknowledges_sender() {
     let server = Server::start(Config::default()).await;
     let (mut a, aid) = server.connect().await;
     let (mut b, bid) = server.connect().await;
-    let (mut c, _) = server.connect().await;
-    assert_ne!(aid, bid);
-    let id = start(&mut a, bid).await;
-    event(&mut b, "talk_started").await;
-    for sequence in 0..3 {
-        let frame = audio(id, sequence, if sequence == 2 { 2 } else { 640 });
-        a.send(Message::Binary(frame.clone().into())).await.unwrap();
-        assert_eq!(binary(&mut b).await, frame);
+    let (mut observer, _) = server.connect().await;
+    for sample in [HELLO, NUMBERS, LONG] {
+        let id = begin(&mut a, bid, sample.len()).await;
+        a.send(Message::Binary(sample.to_vec().into()))
+            .await
+            .unwrap();
+        received(&mut b, id, aid, sample).await;
+        assert_eq!(
+            event(&mut a, "message_accepted").await["message_id"],
+            id.to_string()
+        );
     }
-    control(&mut a, json!({"type":"stop_talk", "transmission_id":id})).await;
-    assert_eq!(event(&mut b, "talk_ended").await["reason"], "released");
-    event(&mut a, "talk_ended").await;
-    // Stopping twice is harmless and doesn't prevent a reverse transmission.
-    control(&mut a, json!({"type":"stop_talk", "transmission_id":id})).await;
-    let reverse = start(&mut b, aid).await;
-    event(&mut a, "talk_started").await;
-    let frame = audio(reverse, 0, 640);
-    b.send(Message::Binary(frame.clone().into())).await.unwrap();
-    assert_eq!(binary(&mut a).await, frame);
-    // The third client may receive presence, but never private audio or lifecycle events.
+    let id = begin(&mut b, aid, HELLO.len()).await;
+    b.send(Message::Binary(HELLO.to_vec().into()))
+        .await
+        .unwrap();
+    received(&mut a, id, bid, HELLO).await;
     assert!(
         tokio::time::timeout(Duration::from_millis(100), async {
             loop {
-                match next(&mut c).await {
-                    Message::Binary(_) => panic!("audio leaked to third client"),
+                match next(&mut observer).await {
                     Message::Text(text) => assert_eq!(
                         serde_json::from_str::<Value>(&text).unwrap()["type"],
                         "users"
                     ),
-                    _ => {}
+                    other => panic!("Private message leaked: {other:?}"),
                 }
             }
         })
@@ -130,131 +124,154 @@ async fn routes_ordered_audio_and_release_then_reverse_direction() {
 }
 
 #[tokio::test]
-async fn validates_requests_frames_and_sender_ownership() {
+async fn rejects_invalid_uploads_and_allows_retry_after_consumed_payload() {
     let server = Server::start(Config::default()).await;
     let (mut a, aid) = server.connect().await;
     let (mut b, bid) = server.connect().await;
-    control(&mut a, json!({"type":"start_talk", "recipient_id":aid})).await;
-    assert_eq!(event(&mut a, "error").await["code"], "invalid_recipient");
-    control(
-        &mut a,
-        json!({"type":"start_talk", "recipient_id":Uuid::new_v4()}),
-    )
-    .await;
-    assert_eq!(event(&mut a, "error").await["code"], "unknown_recipient");
-    a.send(Message::Text("not json".into())).await.unwrap();
-    assert_eq!(event(&mut a, "error").await["code"], "invalid_message");
-    let id = start(&mut a, bid).await;
-    event(&mut b, "talk_started").await;
-    control(&mut b, json!({"type":"start_talk", "recipient_id":aid})).await;
-    assert_eq!(event(&mut b, "error").await["code"], "busy");
-    control(&mut b, json!({"type":"stop_talk", "transmission_id":id})).await;
-    assert_eq!(event(&mut b, "error").await["code"], "not_sender");
-    b.send(Message::Binary(audio(id, 0, 640).into()))
+    a.send(Message::Binary(HELLO.to_vec().into()))
         .await
         .unwrap();
-    assert_eq!(event(&mut b, "error").await["code"], "not_sender");
-    for frame in [vec![], vec![0; 19], audio(id, 0, 1), audio(id, 0, 642)] {
-        a.send(Message::Binary(frame.into())).await.unwrap();
-        assert_eq!(event(&mut a, "error").await["code"], "invalid_audio");
+    assert_eq!(event(&mut a, "error").await["code"], "unexpected_audio");
+    for (recipient, size, code) in [
+        (aid, HELLO.len(), "invalid_recipient"),
+        (Uuid::new_v4(), HELLO.len(), "unknown_recipient"),
+        (bid, 0, "invalid_size"),
+        (bid, 524289, "invalid_size"),
+    ] {
+        control(&mut a,json!({"type":"begin_upload","recipient_id":recipient,"request_id":Uuid::new_v4(),"byte_length":size})).await;
+        assert_eq!(event(&mut a, "error").await["code"], code);
     }
-    a.send(Message::Binary(audio(id, 1, 640).into()))
+    begin(&mut a, bid, HELLO.len()).await;
+    control(&mut a,json!({"type":"begin_upload","recipient_id":bid,"request_id":Uuid::new_v4(),"byte_length":HELLO.len()})).await;
+    assert_eq!(event(&mut a, "error").await["code"], "upload_pending");
+    a.send(Message::Binary(vec![0; 44].into())).await.unwrap();
+    assert_eq!(event(&mut a, "error").await["code"], "size_mismatch");
+    begin(&mut a, bid, 44).await;
+    a.send(Message::Binary(vec![0; 44].into())).await.unwrap();
+    assert_eq!(event(&mut a, "error").await["code"], "invalid_wav");
+    let id = begin(&mut a, bid, HELLO.len()).await;
+    a.send(Message::Binary(HELLO.to_vec().into()))
         .await
         .unwrap();
-    assert_eq!(event(&mut a, "error").await["code"], "invalid_sequence");
-    let valid = audio(id, 0, 640);
-    a.send(Message::Binary(valid.clone().into())).await.unwrap();
-    assert_eq!(binary(&mut b).await, valid);
+    received(&mut b, id, aid, HELLO).await;
 }
 
 #[tokio::test]
-async fn updates_presence_and_disconnect_frees_the_survivor() {
+async fn concurrent_uploads_to_one_recipient_keep_metadata_and_audio_together() {
     let server = Server::start(Config::default()).await;
     let (mut a, aid) = server.connect().await;
     let (mut b, bid) = server.connect().await;
-    control(&mut a, json!({"type":"set_name", "name":" Alice "})).await;
+    let (mut c, cid) = server.connect().await;
+    let first = begin(&mut a, bid, HELLO.len()).await;
+    let second = begin(&mut c, bid, NUMBERS.len()).await;
+    let (ra, rc) = tokio::join!(
+        a.send(Message::Binary(HELLO.to_vec().into())),
+        c.send(Message::Binary(NUMBERS.to_vec().into()))
+    );
+    ra.unwrap();
+    rc.unwrap();
+    let mut seen = Vec::new();
+    for _ in 0..2 {
+        let metadata = event(&mut b, "audio_message").await;
+        let id = Uuid::parse_str(metadata["message_id"].as_str().unwrap()).unwrap();
+        let (sender, sample) = if id == first {
+            (aid, HELLO)
+        } else {
+            assert_eq!(id, second);
+            (cid, NUMBERS)
+        };
+        assert_eq!(metadata["sender_id"], sender.to_string());
+        let Message::Binary(data) = next(&mut b).await else {
+            panic!("Interleaved delivery")
+        };
+        assert_eq!(data.as_ref(), sample);
+        seen.push(id);
+    }
+    assert_ne!(seen[0], seen[1]);
+}
+
+#[tokio::test]
+async fn recipient_disconnect_rejects_pending_upload_without_retargeting_it() {
+    let server = Server::start(Config::default()).await;
+    let (mut a, _) = server.connect().await;
+    let (mut b, bid) = server.connect().await;
+    begin(&mut a, bid, HELLO.len()).await;
+    b.close(None).await.unwrap();
     loop {
-        let users = event(&mut b, "users").await;
-        if users["users"]
+        let users = event(&mut a, "users").await;
+        if !users["users"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|u| u["name"] == "Alice")
+            .any(|u| u["id"] == bid.to_string())
         {
             break;
         }
     }
-    start(&mut a, bid).await;
-    event(&mut b, "talk_started").await;
-    a.close(None).await.unwrap();
-    assert_eq!(event(&mut b, "talk_ended").await["reason"], "disconnected");
-    let users = event(&mut b, "users").await;
-    assert!(
-        !users["users"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|u| u["id"] == aid.to_string())
+    a.send(Message::Binary(HELLO.to_vec().into()))
+        .await
+        .unwrap();
+    assert_eq!(
+        event(&mut a, "error").await["code"],
+        "recipient_unavailable"
     );
-    let (mut c, cid) = server.connect().await;
-    start(&mut b, cid).await;
-    event(&mut c, "talk_started").await;
-    // Receiver disconnect also releases the sender.
-    c.close(None).await.unwrap();
-    assert_eq!(event(&mut b, "talk_ended").await["reason"], "disconnected");
+    let (_c, cid) = server.connect().await;
+    begin(&mut a, cid, HELLO.len()).await;
 }
 
 #[tokio::test]
-async fn simultaneous_start_requests_grant_exactly_one_transmission() {
-    let server = Server::start(Config::default()).await;
-    let (mut a, aid) = server.connect().await;
-    let (mut b, bid) = server.connect().await;
-    tokio::join!(
-        control(&mut a, json!({"type":"start_talk","recipient_id":bid})),
-        control(&mut b, json!({"type":"start_talk","recipient_id":aid}))
-    );
-    let first = event(&mut a, "talk_started").await;
-    let second = event(&mut b, "talk_started").await;
-    assert_eq!(first["transmission_id"], second["transmission_id"]);
-    let loser = if first["sender_id"] == aid.to_string() {
-        &mut b
-    } else {
-        &mut a
-    };
-    assert_eq!(event(loser, "error").await["code"], "busy");
+async fn timed_out_upload_closes_connection_to_prevent_late_payload_reuse() {
+    let server = Server::start(Config {
+        upload_timeout: Duration::from_millis(80),
+        ..Config::default()
+    })
+    .await;
+    let (mut a, _) = server.connect().await;
+    let (_b, bid) = server.connect().await;
+    begin(&mut a, bid, HELLO.len()).await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            match a.next().await {
+                None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("timed out connection should close");
 }
 
-#[tokio::test]
-async fn inactivity_and_duration_limits_release_users() {
-    for (idle, max, reason) in [
-        (
-            Duration::from_millis(100),
-            Duration::from_secs(10),
-            "audio_timeout",
-        ),
-        (
-            Duration::from_secs(10),
-            Duration::from_millis(100),
-            "duration_limit",
-        ),
-    ] {
-        let server = Server::start(Config {
-            audio_idle_timeout: idle,
-            max_talk_duration: max,
-            ..Config::default()
-        })
-        .await;
-        let (mut a, _) = server.connect().await;
-        let (mut b, bid) = server.connect().await;
-        start(&mut a, bid).await;
-        assert_eq!(event(&mut b, "talk_ended").await["reason"], reason);
-        start(&mut a, bid).await;
+#[test]
+fn validates_wav_format_duration_and_truncated_audio() {
+    use backend::relay::validate_wav;
+    for sample in [HELLO, NUMBERS, LONG] {
+        validate_wav(sample, Duration::from_secs(15)).unwrap();
     }
+    assert!(validate_wav(HELLO, Duration::from_secs(1)).is_err());
+    assert!(validate_wav(&HELLO[..HELLO.len() - 2], Duration::from_secs(15)).is_err());
+    let mut truncated = HELLO[..HELLO.len() - 2].to_vec();
+    let size = (truncated.len() - 8) as u32;
+    truncated[4..8].copy_from_slice(&size.to_le_bytes());
+    assert!(validate_wav(&truncated, Duration::from_secs(15)).is_err());
+    let mut wav = std::io::Cursor::new(Vec::new());
+    {
+        let writer = hound::WavWriter::new(
+            &mut wav,
+            hound::WavSpec {
+                channels: 2,
+                sample_rate: 44100,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            },
+        )
+        .unwrap();
+        writer.finalize().unwrap();
+    }
+    assert!(validate_wav(wav.get_ref(), Duration::from_secs(15)).is_err());
 }
 
 #[tokio::test]
-async fn congested_connection_is_cancelled_without_blocking_other_users() {
-    use axum::extract::ws::Message as ServerWireMessage;
+async fn congested_recipient_is_not_acknowledged_or_given_partial_delivery() {
     use backend::{
         protocol::ClientMessage,
         state::{AppState, ConnectedUser},
@@ -263,43 +280,52 @@ async fn congested_connection_is_cancelled_without_blocking_other_users() {
     let shared = AppState::new(Config::default());
     let mut state = shared.lock().await;
     let sender = Uuid::new_v4();
-    let slow = Uuid::new_v4();
-    let healthy = Uuid::new_v4();
-    let mut queues = Vec::new();
-    let mut cancellations = Vec::new();
-    for id in [sender, slow, healthy] {
-        let (outgoing, incoming) = mpsc::channel(8);
-        let (cancel, cancelled) = watch::channel(false);
-        state.users.insert(
-            id,
-            ConnectedUser {
-                name: "test".into(),
-                outgoing,
-                cancel,
-                active_transmission: None,
-            },
-        );
-        queues.push(incoming);
-        cancellations.push(cancelled);
-    }
-    state.control(sender, ClientMessage::StartTalk { recipient_id: slow });
-    let talk = state.users[&sender].active_transmission.unwrap();
-    for seq in 0..12 {
-        state.audio(sender, audio(talk, seq, 640).into());
-    }
-    assert!(*cancellations[1].borrow());
-    assert!(!*cancellations[0].borrow());
-    assert!(!*cancellations[2].borrow());
-    // Connection supervision calls disconnect after observing cancellation.
-    state.disconnect(slow);
-    assert!(state.users[&sender].active_transmission.is_none());
-    assert!(!state.transmissions.contains_key(&talk));
-    state.send(healthy, ServerWireMessage::Text("still responsive".into()));
-    let mut found = false;
-    while let Ok(message) = queues[2].try_recv() {
-        if let ServerWireMessage::Text(text) = message {
-            found |= text == "still responsive";
+    let recipient = Uuid::new_v4();
+    let (sender_tx, mut sender_rx) = mpsc::channel(16);
+    let (recipient_tx, mut recipient_rx) = mpsc::channel(1);
+    let (sender_cancel, _) = watch::channel(false);
+    let (recipient_cancel, recipient_cancelled) = watch::channel(false);
+    state.users.insert(
+        sender,
+        ConnectedUser {
+            name: "Sender".into(),
+            outgoing: sender_tx,
+            cancel: sender_cancel,
+            pending_upload: None,
+        },
+    );
+    state.users.insert(
+        recipient,
+        ConnectedUser {
+            name: "Recipient".into(),
+            outgoing: recipient_tx,
+            cancel: recipient_cancel,
+            pending_upload: None,
+        },
+    );
+    state.control(
+        sender,
+        ClientMessage::BeginUpload {
+            recipient_id: recipient,
+            request_id: Uuid::new_v4(),
+            byte_length: HELLO.len(),
+        },
+    );
+    // Presence occupies the recipient's single queue slot.
+    state.audio(sender, HELLO.to_vec().into(), Ok(()));
+    assert!(*recipient_cancelled.borrow());
+    let mut rejected = false;
+    while let Ok(batch) = sender_rx.try_recv() {
+        for msg in batch {
+            if let axum::extract::ws::Message::Text(text) = msg {
+                let value: Value = serde_json::from_str(&text).unwrap();
+                assert_ne!(value["type"], "message_accepted");
+                rejected |= value["code"] == "recipient_unavailable";
+            }
         }
     }
-    assert!(found);
+    assert!(rejected);
+    let batch = recipient_rx.try_recv().unwrap();
+    assert_eq!(batch.len(), 1);
+    assert!(recipient_rx.try_recv().is_err());
 }

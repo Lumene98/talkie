@@ -1,10 +1,42 @@
 use crate::{
-    protocol::{ClientMessage, ServerMessage, parse_audio},
-    state::{AppState, Transmission},
+    protocol::{ClientMessage, MAX_WAV_BYTES, ServerMessage},
+    state::{AppState, PendingUpload},
 };
-use axum::extract::ws::Message;
+use axum::{body::Bytes, extract::ws::Message};
+use std::{io::Cursor, time::Duration};
 use tokio::time::Instant;
 use uuid::Uuid;
+
+/// Validate outside the registry lock: even bounded WAV decoding is CPU work.
+pub fn validate_wav(data: &[u8], max_duration: Duration) -> Result<(), &'static str> {
+    if data.len() < 44 || data.len() > MAX_WAV_BYTES {
+        return Err("WAV must contain 44..524288 bytes");
+    }
+    if &data[..4] != b"RIFF" || &data[8..12] != b"WAVE" {
+        return Err("Expected a RIFF/WAVE file");
+    }
+    let declared = u32::from_le_bytes(data[4..8].try_into().expect("checked header")) as u64 + 8;
+    if declared != data.len() as u64 {
+        return Err("WAV container length does not match its bytes");
+    }
+    let mut reader = hound::WavReader::new(Cursor::new(data)).map_err(|_| "Invalid WAV header")?;
+    let spec = reader.spec();
+    if spec.channels != 1
+        || spec.sample_rate != 16_000
+        || spec.bits_per_sample != 16
+        || spec.sample_format != hound::SampleFormat::Int
+    {
+        return Err("Expected mono, 16 kHz, signed 16-bit PCM WAV");
+    }
+    let samples = reader.duration();
+    if samples == 0 || samples as f64 / 16_000.0 > max_duration.as_secs_f64() {
+        return Err("Audio is empty or exceeds the duration limit");
+    }
+    for sample in reader.samples::<i16>() {
+        sample.map_err(|_| "WAV audio data is truncated or invalid")?;
+    }
+    Ok(())
+}
 
 impl AppState {
     pub fn control(&mut self, sender: Uuid, message: ClientMessage) {
@@ -27,154 +59,172 @@ impl AppState {
                 }
                 self.broadcast_users();
             }
-            ClientMessage::StartTalk { recipient_id } => self.start_talk(sender, recipient_id),
-            ClientMessage::StopTalk { transmission_id } => {
-                if let Some(talk) = self.transmissions.get(&transmission_id) {
-                    if talk.sender_id != sender {
-                        self.error(
-                            sender,
-                            "not_sender",
-                            "Only the sender can stop this transmission",
-                        );
-                        return;
-                    }
-                    self.end_talk(transmission_id, "released");
-                }
-                // Repeated stops are harmless after release, timeout, or disconnect.
+            ClientMessage::BeginUpload {
+                recipient_id,
+                request_id,
+                byte_length,
+            } => {
+                self.begin_upload(sender, recipient_id, request_id, byte_length);
             }
         }
     }
 
-    fn start_talk(&mut self, sender: Uuid, recipient: Uuid) {
+    fn begin_upload(
+        &mut self,
+        sender: Uuid,
+        recipient: Uuid,
+        request_id: Uuid,
+        byte_length: usize,
+    ) {
+        let Some(from) = self.users.get(&sender) else {
+            return;
+        };
+        if *from.cancel.borrow() {
+            return;
+        }
+        if from.pending_upload.is_some() {
+            self.error(
+                sender,
+                "upload_pending",
+                "Finish the pending upload before starting another",
+            );
+            return;
+        }
         if sender == recipient {
             self.error(sender, "invalid_recipient", "Choose another user");
             return;
         }
-        let (Some(from), Some(to)) = (self.users.get(&sender), self.users.get(&recipient)) else {
+        let Some(to) = self.users.get(&recipient) else {
             self.error(sender, "unknown_recipient", "Recipient is not connected");
             return;
         };
-        if *from.cancel.borrow() || *to.cancel.borrow() {
-            self.error(sender, "unavailable", "Connection is closing");
+        if *to.cancel.borrow() {
+            self.error(sender, "unavailable", "Recipient connection is closing");
             return;
         }
-        if from.active_transmission.is_some() || to.active_transmission.is_some() {
-            self.error(sender, "busy", "One of the participants is already busy");
+        if !(44..=MAX_WAV_BYTES).contains(&byte_length) {
+            self.error(sender, "invalid_size", "WAV must contain 44..524288 bytes");
             return;
         }
-        let id = Uuid::new_v4();
-        let now = Instant::now();
-        self.transmissions.insert(
-            id,
-            Transmission {
+        let message_id = Uuid::new_v4();
+        if !self.send(
+            sender,
+            ServerMessage::UploadReady {
+                request_id,
+                message_id,
+            }
+            .into_message(),
+        ) {
+            return;
+        }
+        self.users
+            .get_mut(&sender)
+            .expect("connected sender")
+            .pending_upload = Some(PendingUpload {
+            message_id,
+            recipient_id: recipient,
+            byte_length,
+            started_at: Instant::now(),
+        });
+        self.broadcast_users();
+    }
+
+    /// Called after validation. The next binary message consumes this sender's pending upload.
+    pub fn audio(&mut self, sender: Uuid, data: Bytes, validation: Result<(), &'static str>) {
+        let Some(user) = self.users.get_mut(&sender) else {
+            return;
+        };
+        if *user.cancel.borrow() {
+            return;
+        }
+        let Some(upload) = user.pending_upload.take() else {
+            self.error(
+                sender,
+                "unexpected_audio",
+                "Send BeginUpload and wait for UploadReady first",
+            );
+            return;
+        };
+        if upload.started_at.elapsed() >= self.config.upload_timeout {
+            self.error(
+                sender,
+                "upload_timeout",
+                "Upload timed out; reconnect before retrying",
+            );
+            self.cancel_upload_connection(sender);
+        } else if data.len() != upload.byte_length {
+            self.error(
+                sender,
+                "size_mismatch",
+                "WAV length differs from the announced byte_length",
+            );
+        } else if let Err(message) = validation {
+            self.error(sender, "invalid_wav", message);
+        } else {
+            let metadata = ServerMessage::AudioMessage {
+                message_id: upload.message_id,
                 sender_id: sender,
-                recipient_id: recipient,
-                next_sequence: 0,
-                started_at: now,
-                last_audio_at: now,
-            },
-        );
-        for user_id in [sender, recipient] {
-            self.users
-                .get_mut(&user_id)
-                .expect("validated participant")
-                .active_transmission = Some(id);
-            self.send(
-                user_id,
-                ServerMessage::TalkStarted {
-                    transmission_id: id,
-                    sender_id: sender,
-                    recipient_id: recipient,
-                }
-                .into_message(),
-            );
+                recipient_id: upload.recipient_id,
+                byte_length: data.len(),
+            }
+            .into_message();
+            if self.send_batch(upload.recipient_id, vec![metadata, Message::Binary(data)]) {
+                self.send(
+                    sender,
+                    ServerMessage::MessageAccepted {
+                        message_id: upload.message_id,
+                    }
+                    .into_message(),
+                );
+            } else {
+                self.error(
+                    sender,
+                    "recipient_unavailable",
+                    "Recipient disconnected or cannot accept the message",
+                );
+            }
         }
         self.broadcast_users();
     }
 
-    pub fn audio(&mut self, sender: Uuid, data: axum::body::Bytes) {
-        let (id, sequence) = match parse_audio(&data) {
-            Ok(frame) => frame,
-            Err(message) => {
-                self.error(sender, "invalid_audio", message);
-                return;
-            }
-        };
-        let Some(talk) = self.transmissions.get_mut(&id) else {
-            self.error(sender, "unknown_transmission", "Transmission is not active");
-            return;
-        };
-        if talk.sender_id != sender {
-            self.error(
-                sender,
-                "not_sender",
-                "Connection does not own this transmission",
-            );
-            return;
+    fn cancel_upload_connection(&self, sender: Uuid) {
+        // With untagged WAV uploads, closing prevents late bytes from being
+        // mistaken for a subsequent upload on the same connection.
+        if let Some(user) = self.users.get(&sender) {
+            let _ = user.cancel.send(true);
         }
-        if sequence != talk.next_sequence || sequence == u32::MAX {
-            self.error(
-                sender,
-                "invalid_sequence",
-                "Expected the next sequence number, beginning at zero",
-            );
-            return;
-        }
-        talk.next_sequence += 1;
-        talk.last_audio_at = Instant::now();
-        let recipient = talk.recipient_id;
-        self.send(recipient, Message::Binary(data));
-    }
-
-    pub fn end_talk(&mut self, id: Uuid, reason: &'static str) {
-        let Some(talk) = self.transmissions.remove(&id) else {
-            return;
-        };
-        for participant in [talk.sender_id, talk.recipient_id] {
-            if let Some(user) = self.users.get_mut(&participant)
-                && user.active_transmission == Some(id)
-            {
-                user.active_transmission = None;
-            }
-            self.send(
-                participant,
-                ServerMessage::TalkEnded {
-                    transmission_id: id,
-                    reason,
-                }
-                .into_message(),
-            );
-        }
-        self.broadcast_users();
     }
 
     pub fn disconnect(&mut self, id: Uuid) {
-        if let Some(user) = self.users.remove(&id) {
-            if let Some(talk_id) = user.active_transmission {
-                self.end_talk(talk_id, "disconnected");
-            } else {
-                self.broadcast_users();
-            }
+        if self.users.remove(&id).is_some() {
+            // Other senders retain their pending metadata until their binary
+            // message arrives, so it cannot be associated with a new recipient.
+            self.broadcast_users();
         }
     }
 
     pub fn expire(&mut self) {
-        let now = Instant::now();
         let expired: Vec<_> = self
-            .transmissions
+            .users
             .iter()
-            .filter_map(|(&id, talk)| {
-                if now.duration_since(talk.started_at) >= self.config.max_talk_duration {
-                    Some((id, "duration_limit"))
-                } else if now.duration_since(talk.last_audio_at) >= self.config.audio_idle_timeout {
-                    Some((id, "audio_timeout"))
-                } else {
-                    None
-                }
+            .filter_map(|(&id, user)| {
+                user.pending_upload
+                    .as_ref()
+                    .filter(|upload| upload.started_at.elapsed() >= self.config.upload_timeout)
+                    .map(|_| id)
             })
             .collect();
-        for (id, reason) in expired {
-            self.end_talk(id, reason);
+        for id in expired {
+            self.users
+                .get_mut(&id)
+                .expect("connected sender")
+                .pending_upload = None;
+            self.error(
+                id,
+                "upload_timeout",
+                "Upload timed out; reconnect before retrying",
+            );
+            self.cancel_upload_connection(id);
         }
     }
 }

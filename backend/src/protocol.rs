@@ -2,15 +2,20 @@ use axum::extract::ws::Message;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const AUDIO_HEADER_BYTES: usize = 20;
-pub const MAX_PCM_BYTES: usize = 640;
+pub const MAX_WAV_BYTES: usize = 512 * 1024;
+pub const MAX_CONTROL_BYTES: usize = 4096;
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ClientMessage {
-    SetName { name: String },
-    StartTalk { recipient_id: Uuid },
-    StopTalk { transmission_id: Uuid },
+    SetName {
+        name: String,
+    },
+    BeginUpload {
+        recipient_id: Uuid,
+        request_id: Uuid,
+        byte_length: usize,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -29,14 +34,18 @@ pub enum ServerMessage {
     Users {
         users: Vec<UserInfo>,
     },
-    TalkStarted {
-        transmission_id: Uuid,
+    AudioMessage {
+        message_id: Uuid,
         sender_id: Uuid,
         recipient_id: Uuid,
+        byte_length: usize,
     },
-    TalkEnded {
-        transmission_id: Uuid,
-        reason: &'static str,
+    UploadReady {
+        request_id: Uuid,
+        message_id: Uuid,
+    },
+    MessageAccepted {
+        message_id: Uuid,
     },
     Error {
         code: &'static str,
@@ -52,14 +61,4 @@ impl ServerMessage {
                 .into(),
         )
     }
-}
-
-pub fn parse_audio(data: &[u8]) -> Result<(Uuid, u32), &'static str> {
-    let payload_len = data.len().saturating_sub(AUDIO_HEADER_BYTES);
-    if payload_len == 0 || payload_len > MAX_PCM_BYTES || !payload_len.is_multiple_of(2) {
-        return Err("Expected a 20-byte header and 2..640 even PCM bytes");
-    }
-    let id = Uuid::from_slice(&data[..16]).map_err(|_| "Invalid transmission ID")?;
-    let sequence = u32::from_le_bytes(data[16..20].try_into().expect("validated header"));
-    Ok((id, sequence))
 }

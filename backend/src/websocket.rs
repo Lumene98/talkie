@@ -1,5 +1,6 @@
 use crate::{
-    protocol::{ClientMessage, ServerMessage},
+    protocol::{ClientMessage, MAX_CONTROL_BYTES, MAX_WAV_BYTES, ServerMessage},
+    relay::validate_wav,
     state::{ConnectedUser, SharedState},
 };
 use axum::{
@@ -18,8 +19,8 @@ pub async fn upgrade(
     upgrade: WebSocketUpgrade,
 ) -> impl IntoResponse {
     upgrade
-        .max_message_size(4096)
-        .max_frame_size(4096)
+        .max_message_size(MAX_WAV_BYTES)
+        .max_frame_size(MAX_WAV_BYTES)
         .on_upgrade(move |socket| connection(socket, state))
 }
 
@@ -29,7 +30,7 @@ async fn connection(socket: WebSocket, state: SharedState) {
     let (outgoing, mut messages) = mpsc::channel(config.queue_capacity);
     let (cancel, mut cancelled) = watch::channel(false);
     outgoing
-        .try_send(ServerMessage::Welcome { user_id: id }.into_message())
+        .try_send(vec![ServerMessage::Welcome { user_id: id }.into_message()])
         .expect("empty queue");
     {
         let mut app = state.lock().await;
@@ -39,7 +40,7 @@ async fn connection(socket: WebSocket, state: SharedState) {
                 name: format!("User {}", &id.to_string()[..8]),
                 outgoing,
                 cancel,
-                active_transmission: None,
+                pending_upload: None,
             },
         );
         app.broadcast_users();
@@ -49,6 +50,14 @@ async fn connection(socket: WebSocket, state: SharedState) {
         while let Some(Ok(message)) = stream.next().await {
             match message {
                 Message::Text(text) => {
+                    if text.len() > MAX_CONTROL_BYTES {
+                        state.lock().await.error(
+                            id,
+                            "invalid_message",
+                            "Control messages must not exceed 4096 bytes",
+                        );
+                        continue;
+                    }
                     let parsed = serde_json::from_str::<ClientMessage>(&text);
                     let mut app = state.lock().await;
                     match parsed {
@@ -60,22 +69,28 @@ async fn connection(socket: WebSocket, state: SharedState) {
                         ),
                     }
                 }
-                Message::Binary(data) => state.lock().await.audio(id, data),
+                Message::Binary(data) => {
+                    let validation = validate_wav(&data, config.max_audio_duration);
+                    state.lock().await.audio(id, data, validation);
+                }
                 Message::Close(_) => break,
                 Message::Ping(_) | Message::Pong(_) => {}
             }
         }
     };
     let writer = async {
-        while let Some(message) = messages.recv().await {
-            if !matches!(
-                tokio::time::timeout(config.write_timeout, sink.send(message)).await,
-                Ok(Ok(()))
-            ) {
-                break;
+        while let Some(batch) = messages.recv().await {
+            for message in batch {
+                if !matches!(
+                    tokio::time::timeout(config.write_timeout, sink.send(message)).await,
+                    Ok(Ok(()))
+                ) {
+                    return;
+                }
             }
         }
     };
+
     let maintenance = async {
         let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
         loop {

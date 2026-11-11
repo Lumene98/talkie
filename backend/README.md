@@ -1,90 +1,68 @@
-# Walkie-talkie relay backend
+# Voice-message relay backend
 
-Axum/Tokio WebSocket relay for one-to-one, half-duplex audio. No transcription or audio storage is included.
+Axum/Tokio backend for delivering complete WAV voice messages between connected users. The relay does not yet queue ASR jobs or send transcripts. The separate ASR client and opt-in sample test are available.
 
 ## Run
 
-```sh
-cd backend
-cargo run
-```
+From `backend/`, run `cargo run`. The default address is `127.0.0.1:3000`; override it with `BIND_ADDR`. `GET /health` returns `ok`; `/ws` accepts WebSocket connections.
 
-The default address is `127.0.0.1:3000`. Set `BIND_ADDR` to override it. `GET /health` returns `ok`; `/ws` accepts WebSocket upgrades. Each connection gets a fresh UUID and a default display name. IDs are connection identities, not authenticated accounts. This MVP is intended for local browser sessions.
+Each connection receives a fresh UUID. These are connection identities, not authenticated accounts. Presence is in memory; offline delivery and stored chat history are not implemented.
+
+## Protocol
+
+All controls are JSON text messages. Audio is a complete binary WAV, including its original header. The old PCM frame headers and start/stop-talk controls are no longer supported.
+
+1. Server sends `welcome { user_id }`, then presence snapshots via `users { users: [{id, name, busy}] }`.
+2. Client may send `set_name { name }` to change its display name.
+3. Sender sends `begin_upload { recipient_id, request_id, byte_length }`.
+4. Server responds with `upload_ready { request_id, message_id }` after validating the recipient and announced size.
+5. Sender sends exactly one binary WebSocket message containing the complete WAV. This is associated with that connection's pending upload; no additional binary header is used.
+6. Recipient receives `audio_message { message_id, sender_id, recipient_id, byte_length }` immediately followed by the binary WAV. They are one outgoing queue item so another sender's message cannot interleave between them.
+7. Sender receives `message_accepted { message_id }` after validation and successful recipient queueing. This does not acknowledge receipt, playback, or transcription.
+
+`request_id` correlates the upload grant with its request; it is not an idempotency key. Every accepted upload request gets a new server-generated message ID. Retrying an uncertain delivery may duplicate it.
+
+Only one upload may be pending per sender. Recipients are not reserved: they can receive uploads from multiple people and send while receiving. `busy` indicates that the user has a pending outgoing upload. Presence updates on connection, disconnection, name changes, and upload-state changes.
+
+## Validation and failures
+
+- WAVs must be mono, 16 kHz, signed 16-bit integer PCM, nonempty, and at most 15 seconds long.
+- Files are limited to 512 KiB. The exact binary length must match `byte_length`.
+- Validation checks the RIFF size, format, duration, and readable audio samples outside the shared-state lock. Accepted WAV bytes are delivered unchanged.
+- JSON controls are limited to 4096 bytes. Unknown fields and invalid controls are rejected.
+- Names must contain 1–40 non-control characters after trimming.
+- Server errors contain `code` and `message`. Codes include `invalid_message`, `invalid_name`, `upload_pending`, `invalid_recipient`, `unknown_recipient`, `unavailable`, `invalid_size`, `unexpected_audio`, `size_mismatch`, `invalid_wav`, `recipient_unavailable`, and `upload_timeout`.
+- A second upload request is rejected while the first is pending. The first remains active.
+- A mismatched or invalid binary upload consumes the pending request; the sender can begin a new upload afterward.
+- A recipient who disconnects before delivery causes rejection, not acknowledgment. Pending metadata is retained until the sender submits its binary message or times out, avoiding accidental reassignment of late bytes.
+- Uploads time out after 15 seconds, checked every 250 ms and when a payload arrives. The sender connection closes to prevent a late, untagged WAV from being mistaken for a subsequent upload. The timeout error is best effort; the client must also handle connection closure.
+- Transport messages larger than 512 KiB close the connection.
+
+Limits for upload timeout, audio duration, queue capacity, and socket write timeout are in `state::Config`. File and control byte limits are in `protocol.rs`.
+
+## Execution and scaling
+
+Each connection has a reader, writer, and bounded outgoing queue (32 batches by default). Network writes never occur under the shared-state mutex. A full or closed recipient queue rejects delivery and cancels that recipient connection. Writes time out after 2 seconds. Connection cleanup removes its pending upload and broadcasts updated presence.
+
+Batching preserves audio-message association but does not make network delivery transactional. A disconnect can interrupt a payload even after server acceptance. There are no recipient receipts or persistence yet.
+
+The local MVP uses full presence snapshots, a shared state mutex, and a maintenance timer per connection. At scale, use a central expiry scheduler, connection/rate limits, byte-based queue budgets, partitioned routing, and durable audio storage. A queue can retain up to roughly 16 MiB of WAV payloads per connection at current limits, plus overhead and transport buffers. Multi-instance delivery needs explicit routing or affinity. Public deployment also needs authentication, origin validation, and TLS.
+
+Next, add a bounded ASR job queue after successful audio delivery. Inference must run independently of connection handling, with results correlated by message ID.
+
+## Tests
 
 ```sh
 cargo test
 cargo clippy --all-targets -- -D warnings
 ```
 
-## JSON protocol
+WebSocket tests deliver all three files from `asr/samples` byte-for-byte. They cover private routing, acknowledgments, concurrent uploads, metadata/payload adjacency, invalid uploads, retries, disconnection, timeout closure, WAV validation, and queue congestion.
 
-All controls are WebSocket text messages. UUIDs in JSON use standard UUID strings.
-
-Client messages:
-
-```json
-{"type":"set_name","name":"Alice"}
-{"type":"start_talk","recipient_id":"<recipient UUID>"}
-{"type":"stop_talk","transmission_id":"<transmission UUID>"}
-```
-
-Server messages:
-
-- `welcome`: `user_id`. Always the first event.
-- `users`: `users`, an array of `{id, name, busy}`. Full snapshots, sent on connection, disconnection, name changes, and reservation changes.
-- `talk_started`: `transmission_id`, `sender_id`, `recipient_id`. Sent to both participants; the sender must wait for this grant before sending audio.
-- `talk_ended`: `transmission_id`, `reason`. Reasons: `released`, `disconnected`, `audio_timeout`, `duration_limit`.
-- `error`: `code`, `message`. Errors include `invalid_message`, `invalid_name`, `invalid_recipient`, `unknown_recipient`, `unavailable`, `busy`, `not_sender`, `invalid_audio`, `unknown_transmission`, and `invalid_sequence`.
-
-Names are trimmed and must contain 1–40 characters with no control characters. Unknown JSON fields are rejected. Each participant can belong to only one active transmission, whether speaking or receiving. Only the sender can explicitly stop it. Duplicate stops for ended transmissions are harmless. Controls and audio from a connection are processed in receive order.
-
-## Audio wire format
-
-Each binary WebSocket message contains one frame:
-
-| Offset | Length | Contents |
-| --- | --- | --- |
-| 0 | 16 bytes | Raw transmission UUID bytes (standard UUID byte order) |
-| 16 | 4 bytes | Sequence number, unsigned little-endian, starting at 0 |
-| 20 | 2–640 bytes | Mono 16 kHz signed 16-bit little-endian PCM |
-
-Normal frames contain 320 samples (20 ms); shorter frames are accepted for the final flush. Payloads must have an even length. The server verifies ownership, active transmission, size, and consecutive sequence numbers, then forwards the exact bytes to the recipient only. It does not inspect sample content or enforce real-time pacing. Malformed frames generate an error and do not advance the sequence.
-
-On button release, the browser must finish flushing its capture worklet, send all remaining audio, and then send `stop_talk`. The recipient drains pending playback after `talk_ended`. If release occurs while waiting for a grant, the browser should send stop as soon as the grant arrives. Never reuse an old transmission ID after a timeout or reconnect.
-
-## Execution and limits
-
-- Each connection has one reader and one writer, with a bounded outgoing queue (32 messages).
-- Shared state stores channel handles and reservations, not sockets or audio recordings.
-- A short mutex section makes reservation changes and enqueue order atomic. No network writes or waiting channel sends occur under this lock.
-- A full/closed outgoing queue signals connection cancellation. The connection supervisor stops its reader/writer and removes its reservation. Queued audio may be lost when a connection fails; this is not a graceful release.
-- Individual socket writes time out after 2 seconds.
-- Transmissions expire after 15 seconds or 3 seconds without accepted audio, checked every 250 ms. These values and queue capacity are in `state::Config`.
-- Transport messages and frames are limited to 4096 bytes; audio has the stricter 660-byte limit.
-- Client closure, transport errors, cancellation, and write timeouts share the same cleanup path.
-
-## Verification and scope
-
-Integration tests connect actual WebSocket clients to an ephemeral server and check ordered binary delivery, reverse-direction transmission, third-client isolation, malformed data, sender authorization, busy conflicts, concurrent start requests, presence, disconnection, and timeouts. A deterministic queue-congestion test verifies cancellation and continued delivery to unrelated users without relying on OS socket buffer sizes.
-
-These tests validate the relay with synthetic PCM. Actual browser capture, audible playback, jitter buffering, and measured end-to-end audio latency still need client-side verification.
-
-## Scaling trade-offs
-
-Raw PCM costs about 32 KB/s ingress and 32 KB/s egress per active transmission, before headers. WebSockets use reliable ordered transport, so retransmissions can delay later audio. Bounded queues limit application backlog but do not eliminate buffering in TCP or browsers.
-
-Presence broadcasts, the shared state mutex, and a maintenance timer per connection suit a small local demo. Larger deployments should use one maintenance scheduler, partition routing state, cap connections and message rates, and avoid sending full presence snapshots on every change. Multiple server instances need explicit cross-instance routing or conversation affinity. Authentication, origin validation, and TLS are necessary additions for an internet deployment.
-
-Future transcription should receive audio through a separate bounded path with inference outside the relay's mutex and socket tasks. A slow transcription worker must not delay forwarding.
-
-## ASR sample test
-
-The sample integration test decodes the three WAVs in `asr/samples` to raw PCM, calls the Rust ASR client, and checks for a nonempty `message.content` in the service's Ollama response. It prints each transcript for manual review; it does not assert transcription accuracy against reference text.
-
-With the ASR service and model ready on port 8001, run from `backend/`:
+The ASR test sends complete sample WAVs to the existing service and checks for nonempty Ollama `message.content`. It prints transcripts for manual review; it does not measure accuracy against reference text. With the ASR service and model ready on port 8001:
 
 ```sh
 cargo test --test asr_samples -- --ignored --nocapture
 ```
 
-The live test is ignored by default because it requires the external service. Normal `cargo test --test asr_samples` validates that all fixtures match the relay's audio format without making inference requests.
+That live test is ignored by default and does not run as part of relay verification.
