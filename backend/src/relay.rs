@@ -1,9 +1,11 @@
 use crate::{
     protocol::{ClientMessage, MAX_WAV_BYTES, ServerMessage},
     state::{AppState, PendingUpload},
+    transcription::TranscriptionJob,
 };
 use axum::{body::Bytes, extract::ws::Message};
 use std::{io::Cursor, time::Duration};
+use tokio::sync::mpsc;
 use tokio::time::Instant;
 use uuid::Uuid;
 
@@ -130,7 +132,13 @@ impl AppState {
     }
 
     /// Called after validation. The next binary message consumes this sender's pending upload.
-    pub fn audio(&mut self, sender: Uuid, data: Bytes, validation: Result<(), &'static str>) {
+    pub fn audio(
+        &mut self,
+        sender: Uuid,
+        data: Bytes,
+        validation: Result<(), &'static str>,
+        job_tx: &mpsc::Sender<TranscriptionJob>,
+    ) {
         let Some(user) = self.users.get_mut(&sender) else {
             return;
         };
@@ -168,7 +176,10 @@ impl AppState {
                 byte_length: data.len(),
             }
             .into_message();
-            if self.send_batch(upload.recipient_id, vec![metadata, Message::Binary(data)]) {
+            if self.send_batch(
+                upload.recipient_id,
+                vec![metadata, Message::Binary(data.clone())],
+            ) {
                 self.send(
                     sender,
                     ServerMessage::MessageAccepted {
@@ -176,6 +187,28 @@ impl AppState {
                     }
                     .into_message(),
                 );
+                let job = TranscriptionJob {
+                    message_id: upload.message_id,
+                    sender_id: sender,
+                    recipient_id: upload.recipient_id,
+                    wav: data.clone(),
+                };
+
+                if let Err(error) = job_tx.try_send(job) {
+                    eprintln!(
+                        "Failed to enqueue transcription for {}: {error}",
+                        upload.message_id
+                    );
+
+                    let event = ServerMessage::TranscriptFailed {
+                        message_id: upload.message_id,
+                        reason: "Transcription queue is unavailable".to_owned(),
+                    }
+                    .into_message();
+
+                    self.send(sender, event.clone());
+                    self.send(upload.recipient_id, event);
+                }
             } else {
                 self.error(
                     sender,

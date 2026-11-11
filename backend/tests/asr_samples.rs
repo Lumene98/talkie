@@ -1,3 +1,4 @@
+use axum::body::Bytes;
 use std::{path::PathBuf, time::Duration};
 
 const SAMPLES: [&str; 3] = ["01_hello.wav", "02_numbers.wav", "03_long_message.wav"];
@@ -16,25 +17,25 @@ async fn transcribes_sample_wavs() {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../asr/samples")
             .join(sample);
+
         let wav_file = std::fs::read(&path)
             .unwrap_or_else(|error| panic!("Cannot open {}: {error}", path.display()));
 
         let wav = hound::WavReader::open(&path)
             .unwrap_or_else(|error| panic!("Cannot open {}: {error}", path.display()));
+
         let spec = wav.spec();
         assert_eq!(spec.channels, 1, "{sample}: expected mono audio");
         assert_eq!(spec.sample_rate, 16_000, "{sample}: expected 16 kHz");
         assert_eq!(spec.bits_per_sample, 16, "{sample}: expected 16-bit PCM");
         assert_eq!(spec.sample_format, hound::SampleFormat::Int);
-        let response = backend::asr::transcribe(&client, wav_file)
+
+        let text = backend::asr::transcribe(&client, Bytes::from(wav_file))
             .await
             .unwrap_or_else(|error| panic!("{sample}: transcription failed: {error}"));
-        let text = response
-            .get("message")
-            .and_then(|message| message.get("content"))
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_else(|| panic!("{sample}: expected Ollama message.content, got {response}"));
+
         assert!(!text.trim().is_empty(), "{sample}: empty transcript");
+
         println!("{sample}: {text}");
     }
 }

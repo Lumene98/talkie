@@ -2,8 +2,10 @@ use crate::{
     protocol::{ClientMessage, MAX_CONTROL_BYTES, MAX_WAV_BYTES, ServerMessage},
     relay::validate_wav,
     state::{ConnectedUser, SharedState},
+    transcription::TranscriptionJob,
 };
 use axum::{
+    Extension,
     extract::{
         State,
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -16,17 +18,19 @@ use uuid::Uuid;
 
 pub async fn upgrade(
     State(state): State<SharedState>,
+    Extension(job_tx): Extension<mpsc::Sender<TranscriptionJob>>,
     upgrade: WebSocketUpgrade,
 ) -> impl IntoResponse {
     upgrade
         .max_message_size(MAX_WAV_BYTES)
         .max_frame_size(MAX_WAV_BYTES)
-        .on_upgrade(move |socket| connection(socket, state))
+        .on_upgrade(move |socket| connection(socket, state, job_tx))
 }
 
-async fn connection(socket: WebSocket, state: SharedState) {
+async fn connection(socket: WebSocket, state: SharedState, job_tx: mpsc::Sender<TranscriptionJob>) {
     let id = Uuid::new_v4();
     let config = state.lock().await.config.clone();
+
     let (outgoing, mut messages) = mpsc::channel(config.queue_capacity);
     let (cancel, mut cancelled) = watch::channel(false);
     outgoing
@@ -71,7 +75,7 @@ async fn connection(socket: WebSocket, state: SharedState) {
                 }
                 Message::Binary(data) => {
                     let validation = validate_wav(&data, config.max_audio_duration);
-                    state.lock().await.audio(id, data, validation);
+                    state.lock().await.audio(id, data, validation, &job_tx);
                 }
                 Message::Close(_) => break,
                 Message::Ping(_) | Message::Pong(_) => {}

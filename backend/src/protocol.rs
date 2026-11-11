@@ -44,6 +44,14 @@ pub enum ServerMessage {
         request_id: Uuid,
         message_id: Uuid,
     },
+    TranscriptReady {
+        message_id: Uuid,
+        transcript_body: String,
+    },
+    TranscriptFailed {
+        message_id: Uuid,
+        reason: String,
+    },
     MessageAccepted {
         message_id: Uuid,
     },

@@ -1,8 +1,17 @@
-use backend::{app, state::Config};
+use axum::extract::ws::Message as AxumMessage;
+use backend::{
+    app,
+    protocol::ClientMessage,
+    state::{AppState, Config, ConnectedUser},
+    transcription::TranscriptionJob,
+};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use std::time::Duration;
-use tokio::net::TcpStream;
+use tokio::{
+    net::TcpStream,
+    sync::{mpsc, watch},
+};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 use uuid::Uuid;
 
@@ -270,39 +279,28 @@ fn validates_wav_format_duration_and_truncated_audio() {
     assert!(validate_wav(wav.get_ref(), Duration::from_secs(15)).is_err());
 }
 
-#[tokio::test]
-async fn congested_recipient_is_not_acknowledged_or_given_partial_delivery() {
-    use backend::{
-        protocol::ClientMessage,
-        state::{AppState, ConnectedUser},
-    };
-    use tokio::sync::{mpsc, watch};
-    let shared = AppState::new(Config::default());
-    let mut state = shared.lock().await;
-    let sender = Uuid::new_v4();
-    let recipient = Uuid::new_v4();
-    let (sender_tx, mut sender_rx) = mpsc::channel(16);
-    let (recipient_tx, mut recipient_rx) = mpsc::channel(1);
-    let (sender_cancel, _) = watch::channel(false);
-    let (recipient_cancel, recipient_cancelled) = watch::channel(false);
+// State-level helpers let us test queueing without requiring a real ASR service.
+fn add_user(
+    state: &mut AppState,
+    id: Uuid,
+    name: &str,
+    capacity: usize,
+) -> (mpsc::Receiver<Vec<AxumMessage>>, watch::Receiver<bool>) {
+    let (outgoing, messages) = mpsc::channel(capacity);
+    let (cancel, cancelled) = watch::channel(false);
     state.users.insert(
-        sender,
+        id,
         ConnectedUser {
-            name: "Sender".into(),
-            outgoing: sender_tx,
-            cancel: sender_cancel,
+            name: name.to_owned(),
+            outgoing,
+            cancel,
             pending_upload: None,
         },
     );
-    state.users.insert(
-        recipient,
-        ConnectedUser {
-            name: "Recipient".into(),
-            outgoing: recipient_tx,
-            cancel: recipient_cancel,
-            pending_upload: None,
-        },
-    );
+    (messages, cancelled)
+}
+
+fn begin_state_upload(state: &mut AppState, sender: Uuid, recipient: Uuid) -> Uuid {
     state.control(
         sender,
         ClientMessage::BeginUpload {
@@ -311,21 +309,228 @@ async fn congested_recipient_is_not_acknowledged_or_given_partial_delivery() {
             byte_length: HELLO.len(),
         },
     );
-    // Presence occupies the recipient's single queue slot.
-    state.audio(sender, HELLO.to_vec().into(), Ok(()));
-    assert!(*recipient_cancelled.borrow());
-    let mut rejected = false;
-    while let Ok(batch) = sender_rx.try_recv() {
-        for msg in batch {
-            if let axum::extract::ws::Message::Text(text) = msg {
-                let value: Value = serde_json::from_str(&text).unwrap();
-                assert_ne!(value["type"], "message_accepted");
-                rejected |= value["code"] == "recipient_unavailable";
+    state.users[&sender]
+        .pending_upload
+        .as_ref()
+        .expect("upload must be pending")
+        .message_id
+}
+
+fn drain_text_events(rx: &mut mpsc::Receiver<Vec<AxumMessage>>) -> Vec<Value> {
+    let mut events = Vec::new();
+    while let Ok(batch) = rx.try_recv() {
+        for message in batch {
+            if let AxumMessage::Text(text) = message {
+                events.push(serde_json::from_str(&text).unwrap());
             }
         }
     }
-    assert!(rejected);
+    events
+}
+
+#[tokio::test]
+async fn accepted_audio_enqueues_one_transcription_job_with_original_ids_and_wav() {
+    let shared = AppState::new(Config::default());
+    let mut state = shared.lock().await;
+    let sender = Uuid::new_v4();
+    let recipient = Uuid::new_v4();
+    let (mut sender_rx, _sender_cancelled) = add_user(&mut state, sender, "Sender", 16);
+    let (mut recipient_rx, _recipient_cancelled) = add_user(&mut state, recipient, "Recipient", 16);
+    let (job_tx, mut job_rx) = mpsc::channel::<TranscriptionJob>(4);
+    let message_id = begin_state_upload(&mut state, sender, recipient);
+
+    state.audio(sender, HELLO.to_vec().into(), Ok(()), &job_tx);
+
+    let job = job_rx
+        .try_recv()
+        .expect("one transcription job should be queued");
+    assert_eq!(job.message_id, message_id);
+    assert_eq!(job.sender_id, sender);
+    assert_eq!(job.recipient_id, recipient);
+    // Works whether TranscriptionJob.wav is Bytes or Vec<u8>.
+    assert_eq!(job.wav.as_ref(), HELLO);
+    assert!(matches!(
+        job_rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+
+    let sender_events = drain_text_events(&mut sender_rx);
+    assert!(sender_events.iter().any(|event| {
+        event["type"] == "message_accepted" && event["message_id"] == message_id.to_string()
+    }));
+
+    // Audio metadata and binary WAV must remain in the same outgoing queue item.
+    let mut found_audio = false;
+    while let Ok(batch) = recipient_rx.try_recv() {
+        if let [AxumMessage::Text(metadata), AxumMessage::Binary(wav)] = batch.as_slice() {
+            let metadata: Value = serde_json::from_str(metadata).unwrap();
+            if metadata["type"] == "audio_message" {
+                assert_eq!(metadata["message_id"], message_id.to_string());
+                assert_eq!(metadata["sender_id"], sender.to_string());
+                assert_eq!(wav.as_ref(), HELLO);
+                found_audio = true;
+            }
+        }
+    }
+    assert!(
+        found_audio,
+        "recipient must receive the WAV with its metadata"
+    );
+}
+
+#[tokio::test]
+async fn invalid_audio_does_not_queue_transcription() {
+    let shared = AppState::new(Config::default());
+    let mut state = shared.lock().await;
+    let sender = Uuid::new_v4();
+    let recipient = Uuid::new_v4();
+    let (mut sender_rx, _sender_cancelled) = add_user(&mut state, sender, "Sender", 16);
+    let (mut recipient_rx, _recipient_cancelled) = add_user(&mut state, recipient, "Recipient", 16);
+    let (job_tx, mut job_rx) = mpsc::channel::<TranscriptionJob>(4);
+    begin_state_upload(&mut state, sender, recipient);
+
+    state.audio(
+        sender,
+        HELLO.to_vec().into(),
+        Err("Invalid WAV header"),
+        &job_tx,
+    );
+
+    let sender_events = drain_text_events(&mut sender_rx);
+    assert!(
+        sender_events
+            .iter()
+            .any(|event| event["code"] == "invalid_wav")
+    );
+    assert!(
+        !sender_events
+            .iter()
+            .any(|event| event["type"] == "message_accepted")
+    );
+    let recipient_events = drain_text_events(&mut recipient_rx);
+    assert!(
+        !recipient_events
+            .iter()
+            .any(|event| event["type"] == "audio_message")
+    );
+    assert!(matches!(
+        job_rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+}
+
+#[tokio::test]
+async fn transcription_queue_full_or_closed_notifies_both_participants_without_losing_audio() {
+    for close_receiver in [false, true] {
+        let shared = AppState::new(Config::default());
+        let mut state = shared.lock().await;
+        let sender = Uuid::new_v4();
+        let recipient = Uuid::new_v4();
+        let (mut sender_rx, _sender_cancelled) = add_user(&mut state, sender, "Sender", 16);
+        let (mut recipient_rx, _recipient_cancelled) =
+            add_user(&mut state, recipient, "Recipient", 16);
+        let (job_tx, mut job_rx) = mpsc::channel::<TranscriptionJob>(1);
+        let message_id = begin_state_upload(&mut state, sender, recipient);
+
+        if close_receiver {
+            job_rx.close();
+        } else {
+            // Fill the queue before submitting the audio being tested.
+            job_tx
+                .try_send(TranscriptionJob {
+                    message_id: Uuid::new_v4(),
+                    sender_id: sender,
+                    recipient_id: recipient,
+                    wav: HELLO.to_vec().into(),
+                })
+                .unwrap();
+        }
+
+        state.audio(sender, HELLO.to_vec().into(), Ok(()), &job_tx);
+
+        let sender_events = drain_text_events(&mut sender_rx);
+        assert!(sender_events.iter().any(|event| {
+            event["type"] == "message_accepted" && event["message_id"] == message_id.to_string()
+        }));
+        assert!(sender_events.iter().any(|event| {
+            event["type"] == "transcript_failed" && event["message_id"] == message_id.to_string()
+        }));
+
+        let mut recipient_failed = false;
+        let mut recipient_got_audio = false;
+        while let Ok(batch) = recipient_rx.try_recv() {
+            match batch.as_slice() {
+                [AxumMessage::Text(metadata), AxumMessage::Binary(wav)] => {
+                    let metadata: Value = serde_json::from_str(metadata).unwrap();
+                    if metadata["type"] == "audio_message" {
+                        assert_eq!(metadata["message_id"], message_id.to_string());
+                        assert_eq!(wav.as_ref(), HELLO);
+                        recipient_got_audio = true;
+                    }
+                }
+                _ => {
+                    for message in batch {
+                        if let AxumMessage::Text(text) = message {
+                            let event: Value = serde_json::from_str(&text).unwrap();
+                            if event["type"] == "transcript_failed" {
+                                assert_eq!(event["message_id"], message_id.to_string());
+                                recipient_failed = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(recipient_got_audio, "audio should still be delivered");
+        assert!(
+            recipient_failed,
+            "recipient should be notified of ASR unavailability"
+        );
+
+        if !close_receiver {
+            // The unsuccessful try_send must not replace or append another job.
+            assert!(job_rx.try_recv().is_ok());
+            assert!(matches!(
+                job_rx.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+        }
+    }
+}
+
+#[tokio::test]
+async fn congested_recipient_is_not_acknowledged_or_given_partial_delivery() {
+    let shared = AppState::new(Config::default());
+    let mut state = shared.lock().await;
+    let sender = Uuid::new_v4();
+    let recipient = Uuid::new_v4();
+    let (mut sender_rx, _sender_cancelled) = add_user(&mut state, sender, "Sender", 16);
+    let (mut recipient_rx, recipient_cancelled) = add_user(&mut state, recipient, "Recipient", 1);
+    let (job_tx, mut job_rx) = mpsc::channel::<TranscriptionJob>(4);
+    begin_state_upload(&mut state, sender, recipient);
+
+    // Presence occupies the recipient's single queue slot.
+    state.audio(sender, HELLO.to_vec().into(), Ok(()), &job_tx);
+    assert!(*recipient_cancelled.borrow());
+
+    let sender_events = drain_text_events(&mut sender_rx);
+    assert!(
+        !sender_events
+            .iter()
+            .any(|event| event["type"] == "message_accepted")
+    );
+    assert!(
+        sender_events
+            .iter()
+            .any(|event| event["code"] == "recipient_unavailable")
+    );
+
     let batch = recipient_rx.try_recv().unwrap();
     assert_eq!(batch.len(), 1);
     assert!(recipient_rx.try_recv().is_err());
+    // No transcription should run for audio that was not delivered.
+    assert!(matches!(
+        job_rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
 }
