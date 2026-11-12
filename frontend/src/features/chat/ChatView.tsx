@@ -22,7 +22,6 @@ export function ChatView() {
     bottom.current?.scrollIntoView({ block: 'end' })
   }, [messages.length])
 
-  // Leaving the chat stops playback and any recording in progress.
   useEffect(
     () => () => {
       player.stop()
@@ -67,7 +66,7 @@ export function ChatView() {
               >
                 <Play />
               </Button>
-              <p className={cn(message.transcript.status !== 'ready' && 'text-muted-foreground')}>
+              <p className={cn(message.transcript.status !== 'ready' && 'text-muted-foreground', )}>
                 {transcriptText(message.transcript)}
               </p>
             </div>
