@@ -1,7 +1,13 @@
 .venv/
+venv/
 __pycache__/
 .pytest_cache/
 .git/
-*.pyc
+*.py[cod]
+samples/
 *.wav
 .env
+.env.*
+!.env.example
+*.log
+.DS_Store
