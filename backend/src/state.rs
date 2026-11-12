@@ -7,6 +7,8 @@ use uuid::Uuid;
 
 #[derive(Clone, Debug)]
 pub struct Config {
+    pub asr_url: String,
+    pub asr_timeout: Duration,
     pub queue_capacity: usize,
     pub max_audio_duration: Duration,
     pub upload_timeout: Duration,
@@ -16,6 +18,8 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            asr_url: "http://127.0.0.1:8001/transcribe".to_owned(),
+            asr_timeout: Duration::from_secs(130),
             queue_capacity: 32,
             max_audio_duration: Duration::from_secs(15),
             upload_timeout: Duration::from_secs(15),

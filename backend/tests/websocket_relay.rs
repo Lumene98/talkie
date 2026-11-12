@@ -19,6 +19,7 @@ type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 struct Server {
     url: String,
     task: tokio::task::JoinHandle<()>,
+    _asr: Option<MockAsr>,
 }
 impl Drop for Server {
     fn drop(&mut self) {
@@ -26,13 +27,24 @@ impl Drop for Server {
     }
 }
 impl Server {
-    async fn start(config: Config) -> Self {
+    async fn start(mut config: Config) -> Self {
+        let mock = MockAsr::start(vec![]).await;
+        config.asr_url = mock.url.clone();
+        let mut server = Self::with_asr(config).await;
+        server._asr = Some(mock);
+        server
+    }
+    async fn with_asr(config: Config) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}/ws", listener.local_addr().unwrap());
         let task = tokio::spawn(async move {
             axum::serve(listener, app(config)).await.unwrap();
         });
-        Self { url, task }
+        Self {
+            url,
+            task,
+            _asr: None,
+        }
     }
     async fn connect(&self) -> (Socket, Uuid) {
         let (mut socket, _) = connect_async(&self.url).await.unwrap();
@@ -533,4 +545,164 @@ async fn congested_recipient_is_not_acknowledged_or_given_partial_delivery() {
         job_rx.try_recv(),
         Err(mpsc::error::TryRecvError::Empty)
     ));
+}
+
+struct MockAsr {
+    url: String,
+    requests: mpsc::UnboundedReceiver<(axum::http::HeaderMap, axum::body::Bytes)>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for MockAsr {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+type AsrReply = (axum::http::StatusCode, &'static str, Duration);
+const TRANSCRIPT: &str = r#"{"message":{"content":"language English<asr_text> Hello there! "}}"#;
+
+impl MockAsr {
+    async fn start(replies: Vec<AsrReply>) -> Self {
+        use axum::{Router, routing::post};
+        use std::{collections::VecDeque, sync::Arc};
+        let replies = Arc::new(tokio::sync::Mutex::new(VecDeque::from(replies)));
+        let (tx, requests) = mpsc::unbounded_channel();
+        let router =
+            Router::new().route(
+                "/transcribe",
+                post(
+                    move |headers: axum::http::HeaderMap, body: axum::body::Bytes| {
+                        let replies = replies.clone();
+                        let tx = tx.clone();
+                        async move {
+                            let _ = tx.send((headers, body));
+                            let (status, body, delay) = replies.lock().await.pop_front().unwrap_or(
+                                (axum::http::StatusCode::OK, TRANSCRIPT, Duration::ZERO),
+                            );
+                            tokio::time::sleep(delay).await;
+                            (status, body)
+                        }
+                    },
+                ),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/transcribe", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        Self {
+            url,
+            requests,
+            task,
+        }
+    }
+
+    async fn assert_wav_request(&mut self, wav: &[u8]) {
+        let (headers, body) = tokio::time::timeout(Duration::from_secs(3), self.requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let content_type = headers["content-type"].to_str().unwrap();
+        assert!(content_type.starts_with("multipart/form-data; boundary="));
+        let boundary = content_type.split("boundary=").nth(1).unwrap();
+        let prefix = format!("--{boundary}\r\n");
+        assert!(body.starts_with(prefix.as_bytes()));
+        let header_end = body.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+        let part_headers = std::str::from_utf8(&body[..header_end]).unwrap();
+        assert!(part_headers.contains("name=\"file\""));
+        assert!(part_headers.contains("filename=\"audio.wav\""));
+        assert!(part_headers.contains("audio/wav"));
+        let payload_start = header_end + 4;
+        assert_eq!(&body[payload_start..payload_start + wav.len()], wav);
+        assert_eq!(
+            &body[payload_start + wav.len()..],
+            format!("\r\n--{boundary}--\r\n").as_bytes()
+        );
+    }
+}
+
+async fn upload_and_receive(
+    sender: &mut Socket,
+    sender_id: Uuid,
+    recipient: &mut Socket,
+    recipient_id: Uuid,
+) -> Uuid {
+    let id = begin(sender, recipient_id, HELLO.len()).await;
+    sender
+        .send(Message::Binary(HELLO.to_vec().into()))
+        .await
+        .unwrap();
+    received(recipient, id, sender_id, HELLO).await;
+    assert_eq!(
+        event(sender, "message_accepted").await["message_id"],
+        id.to_string()
+    );
+    id
+}
+
+async fn assert_transcript(socket: &mut Socket, id: Uuid, kind: &str) {
+    let result = event(socket, kind).await;
+    assert_eq!(result["message_id"], id.to_string());
+    if kind == "transcript_ready" {
+        assert_eq!(result["transcript_body"], "Hello there!");
+    } else {
+        assert_eq!(result["reason"], "Transcription is unavailable");
+    }
+}
+
+#[tokio::test]
+async fn wav_reaches_asr_and_transcript_reaches_both_clients() {
+    let mut asr = MockAsr::start(vec![]).await;
+    let server = Server::with_asr(Config {
+        asr_url: asr.url.clone(),
+        ..Config::default()
+    })
+    .await;
+    let (mut a, aid) = server.connect().await;
+    let (mut b, bid) = server.connect().await;
+    let id = upload_and_receive(&mut a, aid, &mut b, bid).await;
+    asr.assert_wav_request(HELLO).await;
+    assert_transcript(&mut a, id, "transcript_ready").await;
+    assert_transcript(&mut b, id, "transcript_ready").await;
+}
+
+#[tokio::test]
+async fn asr_failures_notify_both_clients_and_worker_processes_next_job() {
+    use axum::http::StatusCode;
+    for reply in [
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable",
+            Duration::ZERO,
+        ),
+        (StatusCode::OK, "not json", Duration::ZERO),
+        (StatusCode::OK, r#"{"message":{}}"#, Duration::ZERO),
+        (
+            StatusCode::OK,
+            r#"{"message":{"content":"<asr_text> "}}"#,
+            Duration::ZERO,
+        ),
+        (StatusCode::OK, TRANSCRIPT, Duration::from_secs(1)),
+    ] {
+        let mut asr = MockAsr::start(vec![reply]).await;
+        let server = Server::with_asr(Config {
+            asr_url: asr.url.clone(),
+            asr_timeout: Duration::from_millis(250),
+            ..Config::default()
+        })
+        .await;
+        let (mut a, aid) = server.connect().await;
+        let (mut b, bid) = server.connect().await;
+        let failed_id = upload_and_receive(&mut a, aid, &mut b, bid).await;
+        asr.assert_wav_request(HELLO).await;
+        assert_transcript(&mut a, failed_id, "transcript_failed").await;
+        assert_transcript(&mut b, failed_id, "transcript_failed").await;
+
+        let next_id = upload_and_receive(&mut a, aid, &mut b, bid).await;
+        assert_ne!(next_id, failed_id);
+        asr.assert_wav_request(HELLO).await;
+        assert_transcript(&mut a, next_id, "transcript_ready").await;
+        assert_transcript(&mut b, next_id, "transcript_ready").await;
+    }
 }

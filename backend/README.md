@@ -1,10 +1,16 @@
 # Voice-message relay backend
 
-Axum/Tokio backend for delivering complete WAV voice messages between connected users. The relay does not yet queue ASR jobs or send transcripts. The separate ASR client and opt-in sample test are available.
+Axum/Tokio backend for delivering complete WAV voice messages between connected users. Accepted audio is queued for a separate ASR worker; both participants receive the transcript or a failure event, correlated by message ID.
 
 ## Run
 
 From `backend/`, run `cargo run`. The default address is `127.0.0.1:3000`; override it with `BIND_ADDR`. `GET /health` returns `ok`; `/ws` accepts WebSocket connections.
+
+ASR configuration (environment variables):
+- `ASR_URL`: complete transcription endpoint, default `http://127.0.0.1:8001/transcribe`.
+- `ASR_TIMEOUT_SECS`: positive integer request timeout, default `130` seconds, allowing for the ASR service's 120-second inference timeout. Connection establishment has a separate 5-second limit.
+
+For example: `ASR_URL=http://127.0.0.1:8001/transcribe ASR_TIMEOUT_SECS=180 cargo run`. Invalid URL or timeout settings fail startup.
 
 Each connection receives a fresh UUID. These are connection identities, not authenticated accounts. Presence is in memory; offline delivery and stored chat history are not implemented.
 
@@ -19,6 +25,7 @@ All controls are JSON text messages. Audio is a complete binary WAV, including i
 5. Sender sends exactly one binary WebSocket message containing the complete WAV. This is associated with that connection's pending upload; no additional binary header is used.
 6. Recipient receives `audio_message { message_id, sender_id, recipient_id, byte_length }` immediately followed by the binary WAV. They are one outgoing queue item so another sender's message cannot interleave between them.
 7. Sender receives `message_accepted { message_id }` after validation and successful recipient queueing. This does not acknowledge receipt, playback, or transcription.
+8. Both participants subsequently receive `transcript_ready { message_id, transcript_body }` or `transcript_failed { message_id, reason }`. Transcription failure does not undo audio delivery.
 
 `request_id` correlates the upload grant with its request; it is not an idempotency key. Every accepted upload request gets a new server-generated message ID. Retrying an uncertain delivery may duplicate it.
 
@@ -48,7 +55,9 @@ Batching preserves audio-message association but does not make network delivery 
 
 The local MVP uses full presence snapshots, a shared state mutex, and a maintenance timer per connection. At scale, use a central expiry scheduler, connection/rate limits, byte-based queue budgets, partitioned routing, and durable audio storage. A queue can retain up to roughly 16 MiB of WAV payloads per connection at current limits, plus overhead and transport buffers. Multi-instance delivery needs explicit routing or affinity. Public deployment also needs authentication, origin validation, and TLS.
 
-Next, add a bounded ASR job queue after successful audio delivery. Inference must run independently of connection handling, with results correlated by message ID.
+One background worker processes a bounded ASR queue (32 jobs by default) sequentially, without holding the shared-state lock during HTTP requests. A full or closed queue produces `transcript_failed` for both participants while preserving audio delivery. HTTP errors, invalid responses, and timeouts fail that job; the worker continues with the next. The timeout applies to each HTTP request, not time waiting in the queue.
+
+Jobs and results are in memory: disconnects and restarts can lose transcript delivery, and one slow ASR job delays later jobs. Larger deployments need durable jobs/results and inference concurrency sized to available hardware.
 
 ## Tests
 
@@ -57,7 +66,7 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 ```
 
-WebSocket tests deliver all three files from `asr/samples` byte-for-byte. They cover private routing, acknowledgments, concurrent uploads, metadata/payload adjacency, invalid uploads, retries, disconnection, timeout closure, WAV validation, and queue congestion.
+WebSocket tests use an isolated local ASR stub; they never call the real model. They verify multipart WAV forwarding, transcript delivery to both clients, and recovery after HTTP errors, malformed responses, empty transcripts, and timeouts. They also deliver all three files from `asr/samples` byte-for-byte. They cover private routing, acknowledgments, concurrent uploads, metadata/payload adjacency, invalid uploads, retries, disconnection, timeout closure, WAV validation, and queue congestion.
 
 The ASR test sends complete sample WAVs to the existing service and checks for nonempty Ollama `message.content`. It prints transcripts for manual review; it does not measure accuracy against reference text. With the ASR service and model ready on port 8001:
 

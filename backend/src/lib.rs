@@ -15,11 +15,12 @@ pub fn app(config: Config) -> Router {
     let state = AppState::new(config.clone());
     let (job_tx, job_rx) = mpsc::channel::<TranscriptionJob>(config.queue_capacity);
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(config.asr_timeout)
         .build()
         .expect("Failed to create HTTP client");
 
-    tokio::spawn(run_worker(job_rx, client, state.clone()));
+    tokio::spawn(run_worker(job_rx, client, state.clone(), config.asr_url));
 
     Router::new()
         .route("/health", get(|| async { "ok" }))

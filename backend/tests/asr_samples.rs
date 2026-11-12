@@ -6,6 +6,8 @@ const SAMPLES: [&str; 3] = ["01_hello.wav", "02_numbers.wav", "03_long_message.w
 #[tokio::test]
 #[ignore = "requires the ASR service and loaded model at http://127.0.0.1:8001"]
 async fn transcribes_sample_wavs() {
+    let url =
+        std::env::var("ASR_URL").unwrap_or_else(|_| backend::state::Config::default().asr_url);
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(130))
@@ -30,7 +32,7 @@ async fn transcribes_sample_wavs() {
         assert_eq!(spec.bits_per_sample, 16, "{sample}: expected 16-bit PCM");
         assert_eq!(spec.sample_format, hound::SampleFormat::Int);
 
-        let text = backend::asr::transcribe(&client, Bytes::from(wav_file))
+        let text = backend::asr::transcribe(&client, &url, Bytes::from(wav_file))
             .await
             .unwrap_or_else(|error| panic!("{sample}: transcription failed: {error}"));
 

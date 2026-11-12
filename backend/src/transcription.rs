@@ -15,9 +15,10 @@ pub async fn run_worker(
     mut jobs: mpsc::Receiver<TranscriptionJob>,
     client: reqwest::Client,
     state: SharedState,
+    asr_url: String,
 ) {
     while let Some(job) = jobs.recv().await {
-        let result = crate::asr::transcribe(&client, job.wav).await;
+        let result = crate::asr::transcribe(&client, &asr_url, job.wav).await;
 
         let event = match result {
             Ok(transcript) => ServerMessage::TranscriptReady {

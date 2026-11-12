@@ -2,6 +2,7 @@ use axum::body::Bytes;
 
 pub async fn transcribe(
     client: &reqwest::Client,
+    url: &str,
     wav: Bytes,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let file = reqwest::multipart::Part::stream(wav)
@@ -11,7 +12,7 @@ pub async fn transcribe(
     let form = reqwest::multipart::Form::new().part("file", file);
 
     let response = client
-        .post("http://127.0.0.1:8001/transcribe")
+        .post(url)
         .multipart(form)
         .send()
         .await?
