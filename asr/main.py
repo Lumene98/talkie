@@ -49,6 +49,11 @@ async def transcribe(file: UploadFile = File(...)):
                 "role": "user",
                 "content": "",
                 "images": [encoded_audio]
+            },
+            {
+                # Qwen3-ASR's forced-language prefix skips language detection.
+                "role": "assistant",
+                "content": "language English<asr_text>"
             }
         ]
     }
