@@ -6,6 +6,6 @@ Inspired by [Ryvumi by HALO LAB](https://dribbble.com/shots/27863318-Platform-fo
 - Green dots indicate online; grey indicates offline, including your own status.
 - Selecting a user opens a chat with audio messages and their transcripts.
 - Chats lists conversations with their latest message preview.
-- Hold-to-talk appears only inside a chat, with one speaker at a time.
+- Hold-to-talk appears only inside a chat, with a circular recording control.
 - Simple actions and labels; no promotional headlines or decorative clutter.
-- Responsive layouts and reusable controls suited to shadcn/ui and Tailwind CSS.
+- Responsive layouts and reusable controls implemented with Tailwind CSS and native controls.
