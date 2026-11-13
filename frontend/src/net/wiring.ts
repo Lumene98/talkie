@@ -1,11 +1,6 @@
 import { addMessage, clearChats, setTranscript } from '@/store/chats'
 import { useSession, userName } from '@/store/session'
-import {
-  handleAccepted,
-  handleDisconnect,
-  handleError,
-  handleUploadReady,
-} from '@/store/upload'
+import { handleAccepted, handleDisconnect, handleError, handleUploadReady } from '@/store/upload'
 import { socket } from './client'
 
 /** Routes socket events into the stores. Call once at startup. */
@@ -69,4 +64,3 @@ export function startClient(): void {
   }
   socket.connect()
 }
-

@@ -33,8 +33,19 @@ export function useHoldToRecord(enabled: boolean, onStart: () => void, onStop: (
       target instanceof HTMLElement && ['INPUT', 'TEXTAREA'].includes(target.tagName)
 
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.code !== 'Space' || isTyping(event.target)) return
-      event.preventDefault()   
+      if (
+        event.code !== 'Space' ||
+        isTyping(event.target) ||
+        document.querySelector('dialog[open]')
+      )
+        return
+      if (
+        event.target instanceof HTMLElement &&
+        event.target.closest('button, a, audio, select') &&
+        !event.target.closest('[data-hold-to-talk]')
+      )
+        return
+      event.preventDefault()
       if (!event.repeat) hold.begin()
     }
     const onKeyUp = (event: KeyboardEvent) => {
@@ -64,4 +75,3 @@ export function useHoldToRecord(enabled: boolean, onStart: () => void, onStop: (
     onLostPointerCapture: hold.end,
   }
 }
-

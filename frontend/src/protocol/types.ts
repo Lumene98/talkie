@@ -65,7 +65,6 @@ const SERVER_TYPES = new Set([
   'error',
 ])
 
-
 export function parseServerMessage(raw: string): ServerMessage | null {
   try {
     const value: unknown = JSON.parse(raw)

@@ -125,4 +125,3 @@ export function failureText(code: FailureCode): string {
       return 'Message not sent. Try again.'
   }
 }
-

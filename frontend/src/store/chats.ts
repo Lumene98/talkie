@@ -2,9 +2,7 @@ import { create } from 'zustand'
 import type { MessageId, UserId } from '@/protocol/types'
 
 export type Transcript =
-  | { status: 'pending' }
-  | { status: 'ready'; text: string }
-  | { status: 'failed' }
+  { status: 'pending' } | { status: 'ready'; text: string } | { status: 'failed' }
 
 export interface ChatMessage {
   id: MessageId
@@ -52,4 +50,3 @@ export function transcriptText(transcript: Transcript): string {
   if (transcript.status === 'pending') return 'Transcribing…'
   return 'Transcript unavailable'
 }
-

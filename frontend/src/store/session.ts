@@ -22,7 +22,7 @@ function savedName(): string {
   try {
     return localStorage.getItem(NAME_KEY) ?? ''
   } catch {
-    return ''  
+    return ''
   }
 }
 
@@ -42,7 +42,7 @@ export function setName(input: string): string | null {
   if ([...name].length > NAME_MAX_CHARS) return `Use ${NAME_MAX_CHARS} characters or fewer.`
 
   localStorage.setItem(NAME_KEY, name)
-  
+
   useSession.setState({ name, nameDialogOpen: false })
   // If the socket is down this is skipped; the name is sent again on `welcome`.
   socket.send({ type: 'set_name', name })
@@ -64,4 +64,3 @@ export function openChat(peerId: UserId): void {
 export function userName(id: UserId): string {
   return useSession.getState().users.find((user) => user.id === id)?.name ?? 'Unknown'
 }
-
